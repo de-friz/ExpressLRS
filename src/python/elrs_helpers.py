@@ -13,7 +13,7 @@ def get_git_version():
     sha: the 6 character short sha for the current HEAD revison, falling back to
         VERSION file if not in a git repo
     """
-    ver = "ver.unknown"
+    ver = "3.5.2*"
     sha = "000000"
 
     try:
