@@ -10,6 +10,7 @@
 #include "stubborn_sender.h"
 
 #include "devHandset.h"
+#include "devADC.h"
 #include "devLED.h"
 #include "devLUA.h"
 #include "devWIFI.h"
@@ -92,10 +93,6 @@ uint8_t MSPDataPackage[5];
 static uint8_t BindingSendCount;
 bool RxWiFiReadyToSend = false;
 
-bool headTrackingEnabled = false;
-static uint16_t ptrChannelData[3] = {CRSF_CHANNEL_VALUE_MID, CRSF_CHANNEL_VALUE_MID, CRSF_CHANNEL_VALUE_MID};
-static uint32_t lastPTRValidTimeMs;
-
 static TxTlmRcvPhase_e TelemetryRcvPhase = ttrpTransmitting;
 StubbornReceiver TelemetryReceiver;
 StubbornSender MspSender;
@@ -106,6 +103,7 @@ device_affinity_t ui_devices[] = {
   {&LED_device, 0},
   {&RGB_device, 0},
   {&LUA_device, 1},
+  {&ADC_device, 1},
   {&WIFI_device, 0},
   {&Button_device, 0},
 #if defined(PLATFORM_ESP32)
@@ -558,47 +556,6 @@ void ICACHE_RAM_ATTR HandlePrepareForTLM()
   }
 }
 
-void injectBackpackPanTiltRollData(uint32_t const now)
-{
-#if defined(PLATFORM_ESP32)
-  // Do not override channels if the backpack is NOT communicating or PanTiltRoll is disabled
-  if (config.GetPTREnableChannel() == HT_OFF || backpackVersion[0] == 0)
-  {
-    return;
-  }
-
-  uint8_t ptrStartChannel = config.GetPTRStartChannel();
-  bool enable = config.GetPTREnableChannel() == HT_ON;
-  if (!enable)
-  {
-    uint8_t chan = CRSF_to_BIT(ChannelData[config.GetPTREnableChannel() / 2 + 3]);
-    if (config.GetPTREnableChannel() % 2 == 0)
-    {
-      enable |= chan;
-    }
-    else
-    {
-      enable |= !chan;
-    }
-  }
-
-  if (enable != headTrackingEnabled)
-  {
-    headTrackingEnabled = enable;
-    HTEnableFlagReadyToSend = true;
-  }
-
-  // If enabled and this packet is less that 1 second old then use it
-  if (enable && now - lastPTRValidTimeMs < 1000)
-  {
-    ChannelData[ptrStartChannel + 4] = ptrChannelData[0];
-    ChannelData[ptrStartChannel + 5] = ptrChannelData[1];
-    ChannelData[ptrStartChannel + 6] = ptrChannelData[2];
-  }
-  // else if not enabled or PTR is old, do not override ChannelData from handset
-#endif
-}
-
 void ICACHE_RAM_ATTR SendRCdataToRF()
 {
   // Do not send a stale channels packet to the RX if one has not been received from the handset
@@ -690,7 +647,6 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
       // always enable msp after a channel package since the slot is only used if MspSender has data to send
       NextPacketIsMspData = true;
 
-      injectBackpackPanTiltRollData(now);
       OtaPackChannelData(&otaPkt, ChannelData, TelemetryReceiver.GetCurrentConfirm(), ExpressLRS_currTlmDenom);
     }
   }
@@ -860,8 +816,8 @@ void ResetPower()
 static void ChangeRadioParams()
 {
   ModelUpdatePending = false;
+  ResetPower(); // Call before SetRFLinkRate(). The LR1121 Radio lib can now set the correct output power in Config().
   SetRFLinkRate(config.GetRate());
-  ResetPower();
 }
 
 void ModelUpdateReq()
@@ -928,7 +884,8 @@ static void CheckConfigChangePending()
 
 bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status const status)
 {
-  if (LQCalc.currentIsSet())
+  // busyTransmitting is required here to prevent accidental rxdone IRQs due to interference triggering RXdoneISR.
+  if (LQCalc.currentIsSet() || busyTransmitting)
   {
     return false; // Already received tlm, do not run ProcessTLMpacket() again.
   }
@@ -940,7 +897,7 @@ bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status const status)
     SetClearChannelAssessmentTime();
   }
 #endif
-  busyTransmitting = false;
+
   return packetSuccessful;
 }
 
@@ -991,8 +948,6 @@ static void UpdateConnectDisconnectStatus()
       apInputBuffer.flush();
       apOutputBuffer.flush();
       uartInputBuffer.flush();
-
-      VtxTriggerSend();
     }
   }
   // If past RX_LOSS_CNT, or in awaitingModelId state for longer than DisconnectTimeoutMs, go to disconnected
@@ -1109,8 +1064,10 @@ static void ExitBindingMode()
   // Reset CRCInit to UID-defined value
   OtaUpdateCrcInitFromUid();
   InBindingMode = false; // Clear binding mode before SetRFLinkRate() for correct IQ
-  
+
   UARTconnected();
+  
+  SetRFLinkRate(config.GetRate()); //return to original rate
 
   DBGLN("Exiting binding mode");
 }
@@ -1158,10 +1115,7 @@ void ProcessMSPPacket(uint32_t now, mspPacket_t *packet)
   }
   else if (packet->function == MSP_ELRS_BACKPACK_SET_PTR && packet->payloadSize == 6)
   {
-    ptrChannelData[0] = packet->payload[0] + (packet->payload[1] << 8);
-    ptrChannelData[1] = packet->payload[2] + (packet->payload[3] << 8);
-    ptrChannelData[2] = packet->payload[4] + (packet->payload[5] << 8);
-    lastPTRValidTimeMs = now;
+    processPanTiltRollPacket(now, packet);
   }
   if (packet->function == MSP_ELRS_GET_BACKPACK_VERSION)
   {
@@ -1283,7 +1237,13 @@ static void setupSerial()
 // Setup TxBackpack
 #if defined(PLATFORM_ESP32)
   Stream *serialPort;
-  if (GPIO_PIN_DEBUG_RX != UNDEF_PIN && GPIO_PIN_DEBUG_TX != UNDEF_PIN)
+  
+  if(firmwareOptions.is_airport) 
+  {
+    serialPort = new HardwareSerial(1);
+    ((HardwareSerial *)serialPort)->begin(firmwareOptions.uart_baud, SERIAL_8N1, U0RXD_GPIO_NUM, U0TXD_GPIO_NUM);
+  }  
+  else if (GPIO_PIN_DEBUG_RX != UNDEF_PIN && GPIO_PIN_DEBUG_TX != UNDEF_PIN)
   {
     serialPort = new HardwareSerial(2);
     ((HardwareSerial *)serialPort)->begin(BACKPACK_LOGGING_BAUD, SERIAL_8N1, GPIO_PIN_DEBUG_RX, GPIO_PIN_DEBUG_TX);
@@ -1315,9 +1275,9 @@ static void setupSerial()
   USBSerial.begin(firmwareOptions.uart_baud);
   TxUSB = &USBSerial;
 #elif defined(PLATFORM_ESP32)
-  if (GPIO_PIN_DEBUG_RX == 3 && GPIO_PIN_DEBUG_TX == 1)
+  if (GPIO_PIN_DEBUG_RX == U0RXD_GPIO_NUM && GPIO_PIN_DEBUG_TX == U0TXD_GPIO_NUM)
   {
-    // The backpack is already assigned on UART0 (pins 3, 1)
+    // The backpack or Airpoirt is already assigned on UART0 (pins 3, 1)
     // This is also USB on modules that use DIPs
     // Set TxUSB to TxBackpack so that data goes to the same place
     TxUSB = TxBackpack;
@@ -1332,7 +1292,7 @@ static void setupSerial()
     // The backpack is on a separate UART to UART0
     // Set TxUSB to pins 3, 1 so that we can access TxUSB and TxBackpack independantly
     TxUSB = new HardwareSerial(1);
-    ((HardwareSerial *)TxUSB)->begin(firmwareOptions.uart_baud, SERIAL_8N1, 3, 1);
+    ((HardwareSerial *)TxUSB)->begin(firmwareOptions.uart_baud, SERIAL_8N1, U0RXD_GPIO_NUM, U0TXD_GPIO_NUM);
   }
 #else
   TxUSB = new NullStream();
