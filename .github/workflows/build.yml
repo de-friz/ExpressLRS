@@ -204,7 +204,7 @@ jobs:
       - name: Checkout targets repo
         uses: actions/checkout@v6
         with:
-          repository: ExpressLRS/targets
+          repository: de-friz/Targets-ELRS
           path: src/hardware
 
       - name: Get firmware artifacts
